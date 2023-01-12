@@ -60,6 +60,7 @@ from mlflow.utils.string_utils import strip_prefix
 from mlflow.recipes.utils.wrapped_recipe_model import WrappedRecipeModel
 from mlflow.models import Model
 from mlflow.utils.file_utils import TempDir
+from mlflow.utils.autologging_utils import safe_patch
 
 _REBALANCING_CUTOFF = 5000
 _REBALANCING_DEFAULT_RATIO = 0.3
@@ -245,6 +246,7 @@ class TrainStep(BaseStep):
             import shutil
             import sklearn
             from sklearn.pipeline import make_pipeline
+            from sklearn import preprocessing
             from sklearn.utils.class_weight import compute_class_weight
             from mlflow.models.signature import infer_signature
 
@@ -322,6 +324,36 @@ class TrainStep(BaseStep):
             best_estimator_params = None
             mlflow.autolog(log_models=False, silent=True)
             with mlflow.start_run(tags=tags) as run:
+                label_encoder = None
+                if "classification" in self.recipe:
+                    label_encoder = preprocessing.LabelEncoder()
+                    label_encoder.fit(y_train)
+                    # y_train = label_encoder.transform(y_train)
+                    # validation_df[self.target_col] = label_encoder.transform(
+                    #     validation_df[self.target_col]
+                    # )
+                    # print("Label encoding added", y_train)
+                    # print("validation_df", validation_df)
+
+                def inverse_label_encoder(predicted_output):
+                    if not label_encoder:
+                        return
+
+                    print("IN INVERSE ENCODING")
+                    return label_encoder.inverse_transform(
+                        predicted_output[f"{self.predict_prefix}label"]
+                    )
+
+                def patched_fit(original, X, y):
+                    print("IN PATCH")
+                    return original(X, label_encoder.transform(y))
+
+                import xgboost
+
+                safe_patch(
+                    "xgboost", xgboost.sklearn.XGBModel, "fit", patched_fit, manage_run=False
+                )
+
                 estimator = self._resolve_estimator(
                     X_train, y_train, validation_df, run, output_directory
                 )
@@ -341,7 +373,9 @@ class TrainStep(BaseStep):
                 # so it can output both predict and predict_proba(for a classification problem)
                 # at the same time.
                 wrapped_model = WrappedRecipeModel(
-                    self.predict_scores_for_all_classes, self.predict_prefix
+                    self.predict_scores_for_all_classes,
+                    self.predict_prefix,
+                    post_predict_fn=inverse_label_encoder,
                 )
 
                 model_uri = get_step_output_path(
